@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+for dscOrChanges; do
+	[ -s "$dscOrChanges" ]
+
+	(
+		set -Eeuo pipefail
+		shell="$(dsc-extract-checksums "$dscOrChanges" | jq -r '.[].bashValidate // error("missing bashValidate from dsc-extract-checksums!")')"
+		[ -n "$shell" ]
+		dir="$(dirname "$dscOrChanges")"
+		cd "$dir"
+		eval "$shell"
+	)
+done

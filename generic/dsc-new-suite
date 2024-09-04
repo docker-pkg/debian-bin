@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'echo >&2 "$BASH_SOURCE: line $LINENO: unexpected exit $?"' ERR
+
+shopt -s dotglob
+
+# usage: $0 target-dir/ new-suite new-version-suffix foo.dsc [bar.dsc [baz.dsc ...]]
+usage() {
+	local self="$0"; self="$(basename "$self")"
+	echo "usage: $self target-dir/ new-suite new-version-suffix foo.dsc [bar.dsc [baz.dsc ...]]"
+	echo "   eg: $self my-output-dir/ buster '~deb10u0' moby-runc_*.dsc moby-containerd_*.dsc"
+}
+fatal_usage() {
+	if [ "$#" -gt 0 ]; then
+		echo >&2 "error: $*"
+		echo >&2
+	fi
+	usage >&2
+	exit 1
+}
+[ "$#" -ge 4 ] || fatal_usage "expected at least 4 arguments (got $#)"
+
+targetDir="$1"; shift
+mkdir -p "$targetDir"
+
+suite="$1"; shift # "jessie"
+suffix="$1"; shift # "~deb8u0"
+
+prog="$(basename "$0")"
+dir="$(mktemp -d -t "$prog.XXXXXX")"
+exitTrap="$(printf 'rm -rf %q' "$dir")"
+trap "$exitTrap" EXIT
+workdir="$dir/workdir"
+
+for dsc; do
+	[ -f "$dsc" ]
+
+	mkdir "$workdir"
+
+	# extract source
+	dpkg-source \
+		--extract "$dsc" \
+		"$workdir/src"
+
+	# munge the changelog with a new entry (but the same date, urgency, etc)
+	changelog="$workdir/src/debian/changelog"
+	pkg="$(dpkg-parsechangelog -l"$changelog" -SSource)"
+	ver="$(dpkg-parsechangelog -l"$changelog" -SVersion)"
+	urg="$(dpkg-parsechangelog -l"$changelog" -SUrgency)"
+	if [ -n "${DEBFULLNAME:-}" ] && [ -n "${DEBEMAIL}" ]; then
+		maint="$DEBFULLNAME <$DEBEMAIL>"
+	else
+		maint="$(dpkg-parsechangelog -l"$changelog" -SMaintainer)"
+	fi
+	if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+		date="$(date --rfc-email --date "@$SOURCE_DATE_EPOCH")"
+	else
+		date="$(dpkg-parsechangelog -l"$changelog" -SDate)"
+	fi
+	echo
+	{
+		echo "$pkg ($ver$suffix) $suite; urgency=$urg"
+		echo
+		echo "  * Repacked for $suite"
+		echo
+		echo " -- $maint  $date"
+		echo
+	} | tee "$workdir/munged-changelog"
+	cat "$workdir/src/debian/changelog" >> "$workdir/munged-changelog"
+	mv "$workdir/munged-changelog" "$workdir/src/debian/changelog"
+
+	# build new source package
+	args=(
+		--build=source
+		--no-pre-clean
+		--no-sign
+		-sa
+	)
+	(
+		cd "$workdir/src"
+		env -i PATH="$PATH" dpkg-buildpackage "${args[@]}"
+	)
+
+	# copy artifacts out
+	dput-local "$targetDir" "$workdir"/*.changes
+
+	rm -rf "$workdir"
+done

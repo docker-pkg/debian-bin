@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'echo >&2 "$BASH_SOURCE: line $LINENO: unexpected exit $?"' ERR
+
+if [ -f "$HOME/.devscripts" ]; then
+	# "USCAN_DESTDIR"
+	source "$HOME/.devscripts" &> /dev/null || :
+fi
+
+# similar to "origtargz --unpack", but supports multiple upstream tarballs
+usage() {
+	local self="$0"; self="$(basename "$self")"
+	echo
+	echo "usage: $self [options]"
+	echo "   ie: $self"
+	echo "       $self --tarballs /my/tarballs"
+	echo "       $self --dest /usr/src/my-cool-package"
+	echo
+	echo 'options:'
+	echo '  -h, -?, --help        show usage'
+	echo '  -t, --tarballs <dir>  where to look for tarballs (multiple)'
+	echo '      (defaults to "..", "$USCAN_DESTDIR", and "../tarballs" if not specified)'
+	echo '  -d, --debian <dir>    where to look for debian/'
+	echo '      (defaults to "<dest>/debian")'
+	echo '  -e, --dest <dir>      where to look for the current source'
+	echo '      (defaults to ".")'
+	echo
+}
+
+if ! options="$(getopt -n "$0" -o 'h?t:d:e:' --long 'help,tarballs:,debian:,dest:' -- "$@")"; then
+	usage >&2
+	exit 1
+fi
+eval set -- "$options"
+
+tarballs=()
+dest=
+debian=
+
+while true; do
+	flag="$1"
+	shift
+	case "$flag" in
+		-h|'-?'|--help)
+			usage
+			exit 0
+			;;
+		-d|--debian)
+			debian="$1"
+			shift
+			;;
+		-e|--dest)
+			dest="$1"
+			shift
+			;;
+		-t|--tarballs)
+			tarballs+=( "$1" )
+			shift
+			;;
+		--)
+			break
+			;;
+	esac
+done
+
+if [ "${#tarballs[@]}" -eq 0 ]; then
+	tarballs=( .. )
+	[ -z "${USCAN_DESTDIR:-}" ] || tarballs+=( "$USCAN_DESTDIR" )
+	tarballs+=( ../tarballs )
+fi
+
+: "${dest:=.}"
+if [ ! -d "$dest" ]; then
+	echo >&2 "error: '$dest' does not exist or is not a directory"
+	exit 1
+fi
+dest="$(readlink -ve "$dest")"
+
+: "${debian:=$dest/debian}"
+if [ ! -d "$debian" ]; then
+	echo >&2 "error: '$debian' does not exist or is not a directory"
+	exit 1
+fi
+debian="$(readlink -ve "$debian")"
+
+changelog="$debian/changelog"
+if [ ! -f "$changelog" ]; then
+	echo >&2 "error: "$changelog" does not exist or is not a file"
+	exit 1
+fi
+
+pkg="$(dpkg-parsechangelog -l"$changelog" -SSource)"
+ver="$(dpkg-parsechangelog -l"$changelog" -SVersion)"
+
+origVer="${ver%-*}" # strip everything from the last dash
+if [ "$origVer" = "$ver" ]; then
+	# native package!  no orig.tar exists
+	echo >&2 "$pkg is native! ($ver)"
+	exit
+fi
+origVer="$(echo "$origVer" | sed -r 's/^[0-9]+://')" # strip epoch
+origTarballPrefix="${pkg}_${origVer}.orig"
+
+origTarball=
+tarballDir=
+for dir in "${tarballs[@]}"; do
+	for f in "$dir/$origTarballPrefix".tar.*; do
+		[ -f "$f" ] || continue
+		origTarball="$f"
+		tarballDir="$dir"
+		break 2
+	done
+	for f in "$dir/$origTarballPrefix"-*.tar.*; do
+		[ -f "$f" ] || continue
+		tarballDir="$dir"
+		break 2
+	done
+done
+
+if [ -z "$origTarball" ] && [ -z "$tarballDir" ]; then
+	echo >&2 "error: no '$origTarballPrefix.tar.*' in any of:" "${tarballs[@]}"
+	exit 1
+elif [ -z "$origTarball" ]; then
+	echo >&2 "warning: no '$origTarballPrefix.tar.*' in any of:" "${tarballs[@]}"
+fi
+tarballDir="$(readlink -ve "$tarballDir")"
+
+declare -A multiTarballs
+multiTarballs=()
+for f in "$tarballDir/$origTarballPrefix"-*.tar.*; do
+	[ -f "$f" ] || continue
+
+	component="${f#$tarballDir/$origTarballPrefix-}"
+	component="${component%%.tar.*}"
+	multiTarballs["$component"]="$f"
+done
+
+extractTarball() {
+	local tarball="$1"; shift
+	local destDir="$1"; shift
+	local excludes=( "$@" ) # for preventing debian/ from being clobbered
+
+	rsyncArgs=()
+	for exclude in "${excludes[@]}"; do
+		if [ "${exclude#$destDir/}" != "$exclude" ]; then
+			rsyncArgs+=( --exclude="/${exclude#$destDir/}" )
+		fi
+	done
+
+	tmpDir="$(mktemp -d -t extract-origtargz-XXXXXX)"
+
+	echo -n "extracting '$tarball' ... "
+	tar -xf "$tarball" -C "$tmpDir"
+	echo 'done'
+
+	files=( "$tmpDir"/* )
+	if [ "${#files[@]}" -eq 0 ]; then
+		rm -rf "$tmpDir"
+		return
+	fi
+
+	srcDir="${files[0]}"
+	if [ "${#files[@]}" -gt 1 ]; then
+		echo >&2 "warning: '$tarball' contained more than just a single directory"
+		echo >&2 "  copying all contents directly to '$destDir'"
+		srcDir="$tmpDir"
+	fi
+
+	# make sure rsyncArgs is never empty for poor folk (*cough* xenial *cough*) who don't have Bash 4.4+ yet
+	# (rsyncArgs[@]: unbound variable)
+	rsyncArgs+=( "$srcDir"/ )
+
+	echo -n "filling '$destDir' ... "
+	rsync -a "${rsyncArgs[@]}" "$destDir"/
+	echo 'done'
+
+	rm -rf "$tmpDir"
+}
+
+echo -n "cleaning out '$dest' (excluding '.git', '.svn', and '$debian') ... "
+find "$dest" -mindepth 1 \( -name '.git' -o -name '.svn' -o -path "$debian" \) -prune -o -not -type d -exec rm -f '{}' +
+find "$dest" -depth -mindepth 1 -not \( -name '.git' -o -path '*/.git/*' -o -name '.svn' -o -path '*/.svn/*' -o -path "$debian" -o -path "$debian/*" \) -exec rmdir '{}' +
+echo 'done'
+
+if [ -n "$origTarball" ]; then
+	origTarball="$(readlink -ve "$origTarball")"
+	extractTarball "$origTarball" "$dest" "$debian"
+fi
+
+for component in "${!multiTarballs[@]}"; do
+	compTarball="${multiTarballs["$component"]}"
+	extractTarball "$compTarball" "$dest/$component" "$debian"
+done
